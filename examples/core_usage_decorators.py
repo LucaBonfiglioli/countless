@@ -38,14 +38,12 @@ def crop_point(operation: MyCrop, target: MyPoints) -> MyPoints:
     return MyPoints(target.xy - dxy.unsqueeze(0))
 
 
-images = MyImage(torch.rand(3, 100, 100))
+image = MyImage(torch.rand(3, 100, 100))
 points = MyPoints(torch.tensor([[50, 50], [20, 30]]))
-
 op = MyCrop(10, 20, 80, 80)
+out = apply(op, image=image, points=points)
+image = out.by_type(MyImage)["image"].image
+points = out.by_type(MyPoints)["points"].xy
 
-out = apply(op, curse=images, pinolo=points)
-images = out.by_type(MyImage)["curse"].image  # Image: 2 x 3 x 80 x 80
-points = out.by_type(MyPoints)["pinolo"].xy  # Points: [[40, 40], [0, 20]]
-
-print("Images:", images.shape)
+print("Images:", image.shape)
 print("Points:", points)
