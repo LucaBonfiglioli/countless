@@ -1,21 +1,18 @@
 from __future__ import annotations
 
-import abc
 import collections.abc as c
 import typing as t
-from dataclasses import dataclass
-
-import torch
+from abc import ABC, ABCMeta, abstractmethod
 
 
-class Named(abc.ABC):
+class Named(ABC):
     """A named class. This is used to register operations, targets and implementations
     without relying on the __name__ attribute of the class, but rather on an explicit
     name() method.
     """
 
     @classmethod
-    @abc.abstractmethod
+    @abstractmethod
     def name(cls) -> str:
         """The name of the class. Can be different from __name__ attribute if needed.
 
@@ -30,11 +27,29 @@ A = t.TypeVar("A")
 B = t.TypeVar("B")
 """Generic type variable for anything."""
 
-# Type alias for Named types
 N = t.TypeVar("N", bound=Named)
+"""Generic type variable for Named."""
+
+ANYTHING = "__anything__"
+"""Special value to match anything."""
 
 
-class RegistryMeta(abc.ABCMeta, t.Generic[N]):
+class Batched(ABC, t.Generic[A]):
+    @abstractmethod
+    def size(self) -> int:
+        pass
+
+    @abstractmethod
+    def unbatch(self) -> c.Iterable[A]:
+        pass
+
+    @classmethod
+    @abstractmethod
+    def batch(cls, *unbatched: A) -> Batched[A]:
+        pass
+
+
+class RegistryMeta(ABCMeta, t.Generic[N]):
     """Metaclass to register Named classes concrete implementations, and to retrieve
     them by name.
     """
@@ -51,16 +66,16 @@ class RegistryMeta(abc.ABCMeta, t.Generic[N]):
         return new_cls
 
     @classmethod
-    def get(cls, name: str) -> N:
+    def get(cls, name: str) -> t.Optional[N]:
         """Get a class by name, if it exists.
 
         Args:
             name (str): The name of the class to retrieve.
 
         Returns:
-            N: The class with the given name.
+            Optional[N]: The class with the given name.
         """
-        return cls._registry[name]
+        return cls._registry.get(name)
 
 
 class TypedMap(c.Mapping[str, A]):
@@ -138,6 +153,30 @@ class ImplementationMeta(RegistryMeta[Implementation]):
     _registry: dict[str, type[Implementation]] = {}
 
 
+class Target(Named, metaclass=TargetMeta):
+    """Base class for targets. Targets are classes that represent the objects that
+    operations are applied to. Concrete targets should define the attributes required
+    by the operations that can be applied to them, usually a tensor or a collection of
+    tensors.
+
+    Targets should not contain any operation logic, which is instead implemented in
+    `Implementation` classes.
+    """
+
+    pass
+
+
+T = t.TypeVar("T", bound=Target)
+"""Generic type variable for targets."""
+
+
+class BatchedTarget(Batched[T], Target):
+    pass
+
+
+BT = t.TypeVar("BT", bound=BatchedTarget)
+
+
 class Operation(Named, metaclass=OperationMeta):
     """Base class for operations. Operations are classes that represent a computation
     (i.e. a function) to be performed on a target.
@@ -153,10 +192,11 @@ class Operation(Named, metaclass=OperationMeta):
     design time, and are instead defined by the user.
     """
 
+    def _apply_single_only_target_batched(self, target: BT) -> BT:
+        return target.batch(*[self.apply_single(t) for t in target.unbatch()])
+
     def apply_single(self, target: T) -> T:
-        """Apply this operation to a target. This method is just a shortcut for
-        `apply_single(op, target)`. The implementation is automatically looked up based
-        on the operation and target types, inferred from the arguments.
+        """Apply this operation to a target.
 
         Args:
             target (T): The target to apply the operation to.
@@ -165,12 +205,36 @@ class Operation(Named, metaclass=OperationMeta):
             T: The result of the operation. Guaranteed to be of the same type as the
             input target.
         """
-        return apply_single(self, target)
+        impl_name = Implementation.name_from(self.name(), target.name())  # type: ignore
+        impl = Implementation.get(impl_name)
+
+        if impl is not None:
+            return impl.impl(self, target)  # type: ignore
+
+        # Check if there is a generic implementation for this operation
+        impl_name = Implementation.name_from(self.name(), ANYTHING)  # type: ignore
+        impl = Implementation.get(impl_name)
+
+        if impl is not None:
+            return impl.impl(self, target)  # type: ignore
+
+        # Check if there is a generic implementation for this target
+        impl_name = Implementation.name_from(ANYTHING, target.name())  # type: ignore
+        impl = Implementation.get(impl_name)
+
+        if impl is not None:
+            return impl.impl(self, target)  # type: ignore
+
+        # Check if the target is batched and the operation is not
+        if isinstance(target, BatchedTarget) and not isinstance(self, BatchedOperation):
+            return self._apply_single_only_target_batched(target)  # type: ignore
+
+        raise NotImplementedError(
+            f"No implementation found for op {self.name()} on target {target.name()}"  # type: ignore
+        )
 
     def apply(self, **targets: Target) -> TypedMap:
-        """Apply this operation to multiple targets. This method is just a shortcut for
-        `apply(op, **targets)`. The implementation is automatically looked up based on
-        the operation and target types, inferred from the arguments.
+        """Apply this operation to multiple targets.
 
         Args:
             **targets (Target): The targets to apply the operation to.
@@ -181,26 +245,54 @@ class Operation(Named, metaclass=OperationMeta):
             of the operation. The types of the values are the same as the types of the
             input targets.
         """
-        return apply(self, **targets)
-
-
-class Target(Named, metaclass=TargetMeta):
-    """Base class for targets. Targets are classes that represent the objects that
-    operations are applied to. Concrete targets should define the attributes required
-    by the operations that can be applied to them, usually a tensor or a collection of
-    tensors.
-
-    Targets should not contain any operation logic, which is instead implemented in
-    `Implementation` classes.
-    """
-
-    pass
+        return TypedMap(
+            {name: self.apply_single(target) for name, target in targets.items()}
+        )
 
 
 O = t.TypeVar("O", bound=Operation)
 """Generic type variable for operations."""
-T = t.TypeVar("T", bound=Target)
-"""Generic type variable for targets."""
+
+
+class BatchedOperation(Batched[O], Operation):
+    def _default_both_batched(self, target: BT) -> BT:
+        assert target.size() == self.size()
+
+        unbatched_t = target.unbatch()
+        unbatched_o = self.unbatch()
+
+        unbatched_r = [o.apply_single(t) for o, t in zip(unbatched_o, unbatched_t)]
+
+        return target.batch(*unbatched_r)
+
+    def _default_only_operation_batched(self, target: T) -> T:
+        first_op = next(iter(self.unbatch()))
+        return first_op.apply_single(target)
+
+    def apply_single(self, target: T) -> T:
+        try:
+            return super().apply_single(target)
+        except NotImplementedError:
+            if isinstance(target, BatchedTarget):
+                return self._default_both_batched(target)
+            else:
+                return self._default_only_operation_batched(target)
+
+
+class Sequential(Operation):
+    """A sequential operation that applies a list of operations in order."""
+
+    def __init__(self, *operations: Operation):
+        self.operations = operations
+
+    @classmethod
+    def name(cls) -> str:
+        return "sequential"
+
+    def apply_single(self, target: T) -> T:
+        for op in self.operations:
+            target = op.apply_single(target)
+        return target
 
 
 class Implementation(Named, t.Generic[O, T], metaclass=ImplementationMeta):
@@ -220,7 +312,7 @@ class Implementation(Named, t.Generic[O, T], metaclass=ImplementationMeta):
     """
 
     @classmethod
-    @abc.abstractmethod
+    @abstractmethod
     def operation(cls) -> str:
         """The name of the operation this implementation is for.
 
@@ -230,7 +322,7 @@ class Implementation(Named, t.Generic[O, T], metaclass=ImplementationMeta):
         pass
 
     @classmethod
-    @abc.abstractmethod
+    @abstractmethod
     def target(cls) -> str:
         """The name of the target this implementation is for.
 
@@ -240,7 +332,7 @@ class Implementation(Named, t.Generic[O, T], metaclass=ImplementationMeta):
         pass
 
     @classmethod
-    @abc.abstractmethod
+    @abstractmethod
     def impl(cls, operation: O, target: T) -> T:
         """How this type of operation is implemented on this type of target.
 
@@ -276,134 +368,3 @@ class Implementation(Named, t.Generic[O, T], metaclass=ImplementationMeta):
             str: The name of the implementation.
         """
         return f"{operation}_{target}"
-
-
-def apply_single(operation, target: A) -> A:
-    """Functional version of `Operation.apply_single`. This function will automatically
-    look up the implementation based on the operation and target types, inferred from
-    the arguments, and call the `impl` method.
-
-    Args:
-        operation: The operation to perform.
-        target (A): The target to perform the operation on.
-
-    Returns:
-        A: The result of the operation, of the same type as the input target.
-    """
-    impl_name = Implementation.name_from(operation.name(), target.name())  # type: ignore
-    return Implementation.get(impl_name).impl(operation, target)  # type: ignore
-
-
-def apply(operation, **targets: t.Any) -> TypedMap[Target]:
-    """Functional version of `Operation.apply`. This function will automatically look
-    up the implementation based on the operation and target types, inferred from the
-    arguments, and call the `impl` method.
-
-    Args:
-        operation: The operation to perform.
-
-    Returns:
-        TypedMap[Target]: A typed map containing the results of the operation. The keys
-        are the same as the keys of the input targets, and the values are the results
-        of the operation. The types of the values are the same as the types of the
-        input targets.
-    """
-
-    return TypedMap(
-        {name: apply_single(operation, target) for name, target in targets.items()}
-    )
-
-
-def _make_type(name: str, Base: type[t.Any]) -> t.Callable[[type[A]], type[A]]:
-    def decorator(cls: type[A]) -> type[A]:
-        name_ = name or cls.__name__
-
-        class _Op(Base, cls):
-            @classmethod
-            def name(cls) -> str:
-                return name_
-
-        return _Op
-
-    return decorator
-
-
-def operation(name: str = "") -> t.Callable[[type[A]], type[A]]:
-    """Transform any class into an `Operation`, for the lazy ones. Just decorate any
-    class with `@operation()` and you're done. You can also pass a name to the
-    decorator to override the default name, which is the name of the class.
-
-    Args:
-        name (str, optional): The operation name, if empty, class name is automatically
-        used. Defaults to "".
-
-    Returns:
-        t.Callable[[type[A]], type[A]]: The decorated class.
-    """
-    return _make_type(name, Operation)
-
-
-def target(name: str = "") -> t.Callable[[type[A]], type[A]]:
-    """Transform any class into a `Target`, for the lazy ones. Just decorate any class
-    with `@target()` and you're done. You can also pass a name to the decorator to
-    override the default name, which is the name of the class.
-
-    Args:
-        name (str, optional): The target name, if empty, class name is automatically
-        used. Defaults to "".
-
-    Returns:
-        t.Callable[[type[A]], type[A]]: The decorated class.
-    """
-    return _make_type(name, Target)
-
-
-def impl(operation: str = "", target: str = ""):
-    """Transform any function into an `Implementation`, for the lazy ones. Just decorate
-    any function with `@impl()` and you're done. You can also pass the operation and
-    target names to the decorator to override the default names, which are inferred
-    from the function annotations.
-
-    The only requirements for the function are:
-        - The first argument must be the operation and be named `operation`
-        - The second argument must be the target and be named `target`
-        - The return type must be the same as the target type
-
-    Signature:
-        def fn(operation: A, target: B) -> B:
-            ...
-
-    Args:
-        operation (str, optional): The operation name, if the operation argument is
-        not annotated. If empty, it will be automatically inferred. Defaults to "".
-        target (str, optional): The target name, if the target argument is not
-        annotated. If empty, it will be automatically inferred. Defaults to "".
-    """
-
-    def decorator(fn: t.Callable[[A, B], B]) -> t.Callable[[A, B], B]:
-        nonlocal operation, target
-        if operation == "":
-            annotation = fn.__annotations__["operation"]
-            assert issubclass(annotation, Operation)
-            operation = annotation.name()
-        if target == "":
-            annotation = fn.__annotations__["target"]
-            assert issubclass(annotation, Target)
-            target = annotation.name()
-
-        class _Impl(Implementation[A, B]):  # type: ignore
-            @classmethod
-            def operation(cls) -> str:
-                return operation
-
-            @classmethod
-            def target(cls) -> str:
-                return target  # type: ignore
-
-            @classmethod
-            def impl(cls, operation: A, target: B) -> B:
-                return fn(operation, target)
-
-        return fn
-
-    return decorator

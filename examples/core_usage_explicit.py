@@ -67,9 +67,7 @@ class MyCropPointImpl(Implementation):
 
 image = MyImage(torch.rand(3, 100, 100))
 points = MyPoints(torch.tensor([[50, 50], [20, 30]]))
-
 op = MyCrop(10, 20, 80, 80)
-
 out = op.apply(image=image, points=points)
 image = out.by_type(MyImage)["image"].image
 points = out.by_type(MyPoints)["points"].xy

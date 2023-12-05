@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 import torch
 
-from countless.core import apply, impl, operation, target
+from countless.decorators import apply, impl, operation, target
 
 
 @target()
