@@ -14,10 +14,8 @@ class NoOp(Operation):
 
 @dataclass
 class Crop(Operation):
-    x: int
-    y: int
-    w: int
-    h: int
+    xy: torch.Tensor
+    wh: torch.Tensor
 
     @classmethod
     def name(cls) -> str:

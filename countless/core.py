@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import collections.abc as c
 import typing as t
+import warnings
 from abc import ABC, ABCMeta, abstractmethod
+
+import torch
 
 
 class Named(ABC):
@@ -34,18 +37,57 @@ ANYTHING = "__anything__"
 """Special value to match anything."""
 
 
-class Batched(ABC, t.Generic[A]):
+class Deviced:
+    def _deviced_fields(self) -> list[Deviced]:
+        return [v for k, v in self.__dict__.items() if isinstance(v, Deviced)]
+
+    def _tensor_fields(self) -> list[torch.Tensor]:
+        return [v for k, v in self.__dict__.items() if isinstance(v, torch.Tensor)]
+
+    @property
+    def device(self) -> str:
+        device = "cpu"
+        deviced_fields = self._deviced_fields()
+        tensor_fields = self._tensor_fields()
+        if len(deviced_fields) > 0:
+            device = deviced_fields[0].device
+        elif len(tensor_fields) > 0:
+            device = tensor_fields[0].device.type
+
+        return device
+
+    @device.setter
+    def device(self, device: str) -> None:
+        for field in self._deviced_fields():
+            field.device = device
+        for field in self._tensor_fields():
+            field = field.to(device)
+
+
+D = t.TypeVar("D", bound=Deviced)
+"""Generic type variable for Deviced."""
+
+
+class Batched(ABC, t.Generic[D]):
     @abstractmethod
     def size(self) -> int:
         pass
 
     @abstractmethod
-    def unbatch(self) -> c.Iterable[A]:
+    def unbatch(self) -> c.Iterable[D]:
         pass
 
     @classmethod
+    def batch(cls, *unbatched: D) -> Batched[D]:
+        assert len(unbatched) > 0, "Cannot batch empty list"
+        for op in unbatched[1:]:
+            op.device = unbatched[0].device
+
+        return cls._batch(*unbatched)
+
+    @classmethod
     @abstractmethod
-    def batch(cls, *unbatched: A) -> Batched[A]:
+    def _batch(cls, *unbatched: D) -> Batched[D]:
         pass
 
 
@@ -121,17 +163,17 @@ class TypedMap(c.Mapping[str, A]):
 
 
 # Stub class for type checking
-class Operation(Named):  # type: ignore
+class Operation(Named, Deviced):  # type: ignore
     pass
 
 
 # Stub class for type checking
-class Target(Named):  # type: ignore
+class Target(Named, Deviced):  # type: ignore
     pass
 
 
 # Stub class for type checking
-class Implementation(Named):  # type: ignore
+class Implementation(Named, Deviced):  # type: ignore
     pass
 
 
@@ -153,7 +195,7 @@ class ImplementationMeta(RegistryMeta[Implementation]):
     _registry: dict[str, type[Implementation]] = {}
 
 
-class Target(Named, metaclass=TargetMeta):
+class Target(Named, Deviced, metaclass=TargetMeta):
     """Base class for targets. Targets are classes that represent the objects that
     operations are applied to. Concrete targets should define the attributes required
     by the operations that can be applied to them, usually a tensor or a collection of
@@ -177,7 +219,7 @@ class BatchedTarget(Batched[T], Target):
 BT = t.TypeVar("BT", bound=BatchedTarget)
 
 
-class Operation(Named, metaclass=OperationMeta):
+class Operation(Named, Deviced, metaclass=OperationMeta):
     """Base class for operations. Operations are classes that represent a computation
     (i.e. a function) to be performed on a target.
 
@@ -256,6 +298,11 @@ O = t.TypeVar("O", bound=Operation)
 
 class BatchedOperation(Batched[O], Operation):
     def _default_both_batched(self, target: BT) -> BT:
+        warnings.warn(
+            f"Using the default implementation for batched operation '{self.name()}' on"
+            f" batched target '{target.name()}'. This may be slower than a custom"
+            f" batched implementation.",
+        )
         assert target.size() == self.size()
 
         unbatched_t = target.unbatch()

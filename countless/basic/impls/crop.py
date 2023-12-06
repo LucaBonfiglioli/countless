@@ -5,7 +5,9 @@ from countless.decorators import impl
 
 
 def _crop_spatial(tensor: torch.Tensor, crop: ops.Crop) -> torch.Tensor:
-    return tensor[..., crop.x : crop.x + crop.w, crop.y : crop.y + crop.h]
+    x, y = crop.xy
+    w, h = crop.wh
+    return tensor[..., y : y + h, x : x + w]
 
 
 @impl()
@@ -32,8 +34,7 @@ def crop_camera_matrix(
     operation: ops.Crop, target: targets.CameraMatrix
 ) -> targets.CameraMatrix:
     newmat = target.matrix.clone()
-    newmat[0, 2] -= operation.x
-    newmat[1, 2] -= operation.y
+    newmat[:2, 2] -= operation.xy
     return targets.CameraMatrix(matrix=newmat)
 
 
@@ -50,6 +51,5 @@ def crop_matrices_2d(
     operation: ops.Crop, target: targets.Matrices2D
 ) -> targets.Matrices2D:
     newmat = target.matrices.clone()
-    newmat[..., 0, 2] -= operation.x
-    newmat[..., 1, 2] -= operation.y
+    newmat[..., :2, 2] -= operation.xy
     return targets.Matrices2D(matrices=newmat)
